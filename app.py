@@ -440,14 +440,6 @@ def q8_host_is_safe(hostname):
 
 
 def q8_url_is_safe(url):
-    # 1. Strip whitespace to prevent leading-whitespace parser bypasses (CVE-2023-24329)
-    url = url.strip()
-    
-    # 2. Completely block "@" to prevent userinfo/authority parser confusion 
-    # (e.g., http://example.com@127.0.0.1/) without overblocking normal paths.
-    if "@" in url:
-        return False
-        
     try:
         parsed = urlparse(url)
     except Exception:
@@ -456,12 +448,19 @@ def q8_url_is_safe(url):
     if parsed.scheme not in ("http", "https"):
         return False
         
-    hostname = (parsed.hostname or "").lower()
-    if not hostname:
+    # Standard check for basic auth in the URL
+    if parsed.username or parsed.password:
         return False
         
-    return q8_host_is_safe(hostname)
-
+    # CRITICAL FIX: Only block '@' and '\' if they are injected into the 
+    # network location (netloc) to spoof the parser. This allows safe URLs 
+    # that legitimately have '@' or '\' in their paths.
+    if "@" in parsed.netloc or "\\" in parsed.netloc:
+        return False
+        
+    hostname = (parsed.hostname or "").lower()
+    return bool(hostname) and q8_host_is_safe(hostname)
+    
 @app.post("/q8/check")
 def q8_check():
     body = request.get_json(force=True, silent=True) or {}
