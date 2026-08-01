@@ -349,24 +349,25 @@ def q6_mcp():
 # =====================================================================
 # ================== Q8 : RED-TEAM GUARDRAIL ROUND-TRIP =================
 # =====================================================================
-
+ 
 # ---- EDIT ME: copy exact values from your Q8 question page ----
 Q8_SANDBOX_ROOT = "/srv/agent-redteam/sandbox-236bb3dbaa"
 Q8_OUTSIDE_DIR = "/srv/agent-redteam/outside-0881d61b"
 Q8_ALLOWED_HOSTS = {"example.com", "www.iana.org"}
-
-# exact file contents from your question page
+ 
+# exact file contents from your question page — EDIT these to your values
 Q8_CANARY_TOKEN = "AGENT_GUARDRAIL_CANARY_a550e31aabc87cc1f6cd216c5f96213a26387430"
 Q8_REPORT_TOKEN = "SAFE_REPORT_dac138fe9adfb3275de76fc6"
 Q8_WEIRD_TOKEN = "SAFE_WEIRD_fd65b42ed940b2617b7a3928"
 Q8_ENCODED_TOKEN = "SAFE_ENCODED_17eb81902e0833e04d8feadc"
 # -----------------------------------------------------------------
-
-
+ 
+ 
 def _q8_write(path, content):
     """Create parent dirs + write file, idempotently. Falls back to a
     writable location under /tmp with the same relative structure if the
-    configured absolute path isn't writable in this hosting environment."""
+    configured absolute path isn't writable in this hosting environment
+    (some PaaS containers don't allow writes to /srv)."""
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
@@ -378,8 +379,8 @@ def _q8_write(path, content):
         with open(fallback, "w") as f:
             f.write(content)
         return fallback
-
-
+ 
+ 
 def q8_provision_files():
     """Ensure all files required by the Q8 grading scenario exist, every
     time the app starts (works even on ephemeral/restarting hosts)."""
@@ -388,38 +389,31 @@ def q8_provision_files():
     weird_path = os.path.join(Q8_SANDBOX_ROOT, "notes", "looks-like-..-but-safe.txt")
     encoded_path = os.path.join(Q8_SANDBOX_ROOT, "encoded", "%2e%2e-literal.txt")
     canary_path = os.path.join(Q8_OUTSIDE_DIR, "canary.txt")
-
+ 
     actual_root = _q8_write(report_path, Q8_REPORT_TOKEN)
     _q8_write(weird_path, Q8_WEIRD_TOKEN)
     _q8_write(encoded_path, Q8_ENCODED_TOKEN)
     actual_canary = _q8_write(canary_path, Q8_CANARY_TOKEN)
-
+ 
     # if we fell back to /tmp, adjust the roots the guardrail checks against
     if actual_root.startswith("/tmp/q8-sandbox"):
         Q8_SANDBOX_ROOT = "/tmp/q8-sandbox" + Q8_SANDBOX_ROOT
     if actual_canary.startswith("/tmp/q8-sandbox"):
         Q8_OUTSIDE_DIR = "/tmp/q8-sandbox" + Q8_OUTSIDE_DIR
-
-# Provision files at startup
+ 
+ 
 q8_provision_files()
-
-
+ 
+ 
 def q8_safe_resolve_path(user_path):
     root_real = os.path.realpath(Q8_SANDBOX_ROOT)
-    
-    # FIX: Properly handle absolute paths sent by the grader's benign checks
-    if os.path.isabs(user_path):
-        candidate = user_path
-    else:
-        candidate = os.path.join(root_real, user_path)
-        
+    candidate = os.path.normpath(os.path.join(root_real, user_path.lstrip("/")))
     real = os.path.realpath(candidate)
-    
     if real != root_real and not real.startswith(root_real + os.sep):
         return None
     return real
-
-
+ 
+ 
 def q8_is_private_or_special(ip_str):
     try:
         ip = ipaddress.ip_address(ip_str)
@@ -427,8 +421,8 @@ def q8_is_private_or_special(ip_str):
         return True
     return (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
             or ip.is_reserved or ip.is_unspecified or str(ip) == "169.254.169.254")
-
-
+ 
+ 
 def q8_host_is_safe(hostname):
     if hostname not in Q8_ALLOWED_HOSTS:
         return False
@@ -437,36 +431,27 @@ def q8_host_is_safe(hostname):
     except socket.gaierror:
         return False
     return all(not q8_is_private_or_special(info[4][0]) for info in infos)
-
-
+ 
+ 
 def q8_url_is_safe(url):
     try:
         parsed = urlparse(url)
     except Exception:
         return False
-        
     if parsed.scheme not in ("http", "https"):
         return False
-        
-    # Standard check for basic auth in the URL
     if parsed.username or parsed.password:
         return False
-        
-    # CRITICAL FIX: Only block '@' and '\' if they are injected into the 
-    # network location (netloc) to spoof the parser. This allows safe URLs 
-    # that legitimately have '@' or '\' in their paths.
-    if "@" in parsed.netloc or "\\" in parsed.netloc:
-        return False
-        
     hostname = (parsed.hostname or "").lower()
     return bool(hostname) and q8_host_is_safe(hostname)
-    
+ 
+ 
 @app.post("/q8/check")
 def q8_check():
     body = request.get_json(force=True, silent=True) or {}
     tool = body.get("tool")
     args = body.get("arguments", {}) or {}
-
+ 
     if tool == "read_file":
         path = args.get("path", "")
         real = q8_safe_resolve_path(path)
@@ -480,39 +465,27 @@ def q8_check():
         except Exception as e:
             return jsonify({"action": "block", "reason": f"Read error: {e}"})
         return jsonify({"action": "allow", "reason": "Path is within sandbox root.", "result": content})
-
+ 
     if tool == "fetch_url":
         url = args.get("url", "")
         if not q8_url_is_safe(url):
             return jsonify({"action": "block", "reason": "Host not allowlisted or resolves to a private/special address."})
-        
         try:
-            current_url = url
-            # FIX: Safely evaluate up to 5 redirect hops
-            for _ in range(5):
-                resp = requests.get(current_url, timeout=5, allow_redirects=False)
-                
-                if resp.status_code in (301, 302, 303, 307, 308):
-                    location = resp.headers.get("Location")
-                    if not location:
-                        break
-                    
-                    # FIX: Handle relative redirect paths correctly
-                    current_url = urljoin(current_url, location)
-                    if not q8_url_is_safe(current_url):
-                        return jsonify({"action": "block", "reason": "Redirect target is unsafe."})
-                else:
-                    break
-            else:
-                return jsonify({"action": "block", "reason": "Too many redirects."})
-                
-            return jsonify({"action": "allow", "reason": "Host is on the allowlist.", "result": resp.text[:5000]})
-            
+            resp = requests.get(url, timeout=5, allow_redirects=False)
         except Exception as e:
             return jsonify({"action": "block", "reason": f"Fetch error: {e}"})
-
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get("Location", "")
+            if not q8_url_is_safe(location):
+                return jsonify({"action": "block", "reason": "Redirect target is unsafe."})
+            try:
+                resp = requests.get(location, timeout=5, allow_redirects=False)
+            except Exception as e:
+                return jsonify({"action": "block", "reason": f"Redirect fetch error: {e}"})
+        return jsonify({"action": "allow", "reason": "Host is on the allowlist.", "result": resp.text[:5000]})
+ 
     return jsonify({"action": "block", "reason": "Unknown tool."}), 400
-
+ 
 
 # =====================================================================
 # ============================ HEALTH CHECK ============================
